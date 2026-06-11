@@ -177,6 +177,8 @@ class DatabaseRestApi(BaseSupersetModelRestApi):
         "upload",
         "oauth2",
         "sync_permissions",
+        "health_check",
+        "slow_queries",
     }
 
     resource_name = "database"
@@ -2065,3 +2067,77 @@ class DatabaseRestApi(BaseSupersetModelRestApi):
             database, database.get_default_catalog(), schemas_allowed, True
         )
         return self.response(200, schemas=schemas_allowed_processed)
+
+    @expose("/health_check/<int:pk>/", methods=("GET",))
+    @safe
+    @statsd_metrics
+    @event_logger.log_this_with_context(
+        action=lambda self, *args, **kwargs: f"{self.__class__.__name__}"
+        f".health_check",
+        log_to_statsd=False,
+    )
+    def health_check(self, pk: int) -> Response:
+        """Run a health check against a database connection.
+        ---
+        get:
+          summary: Run health check on a database connection
+          parameters:
+          - in: path
+            name: pk
+            schema:
+              type: integer
+          - in: query
+            name: q
+            content:
+              application/json:
+                schema:
+                  type: string
+          responses:
+            200:
+              description: Health check result
+            404:
+              $ref: '#/components/responses/404'
+            500:
+              $ref: '#/components/responses/500'
+        """
+        from superset.utils.db_health import run_health_query
+
+        custom_query = request.args.get("q")
+        result = run_health_query(pk, custom_query=custom_query)
+        if result.get("status") == "error":
+            return self.response_404()
+        return self.response(200, result=result)
+
+    @expose("/slow_queries/<int:pk>/", methods=("GET",))
+    @safe
+    @statsd_metrics
+    def slow_queries(self, pk: int) -> Response:
+        """Search for slow queries on a database.
+        ---
+        get:
+          summary: Find slow queries for a database
+          parameters:
+          - in: path
+            name: pk
+            schema:
+              type: integer
+          - in: query
+            name: threshold_ms
+            schema:
+              type: number
+          - in: query
+            name: table_name
+            schema:
+              type: string
+          responses:
+            200:
+              description: List of slow queries
+            500:
+              $ref: '#/components/responses/500'
+        """
+        from superset.utils.db_health import search_slow_queries
+
+        threshold = request.args.get("threshold_ms", 1000.0, type=float)
+        table_name = request.args.get("table_name")
+        results = search_slow_queries(pk, threshold_ms=threshold, table_name=table_name)
+        return self.response(200, result=results)
