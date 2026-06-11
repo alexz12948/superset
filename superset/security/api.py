@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 import logging
+import os
 from typing import Any
 
 from flask import current_app, request, Response
@@ -209,6 +210,141 @@ class SecurityRestApi(BaseSupersetApi):
             return self.response_400(message=error.message)
         except ValidationError as error:
             return self.response_400(message=error.messages)
+
+
+class UserDataExportRestApi(BaseSupersetApi):
+    resource_name = "security"
+    allow_browser_login = True
+    openapi_spec_tag = "Security"
+
+    @expose("/user_export/<int:user_id>/", methods=("GET",))
+    @event_logger.log_this
+    @protect()
+    @safe
+    @statsd_metrics
+    @permission_name("read")
+    def export_user_data(self, user_id: int) -> Response:
+        """Export user activity data for GDPR compliance.
+        ---
+        get:
+          summary: Export user activity data
+          parameters:
+          - in: path
+            name: user_id
+            schema:
+              type: integer
+          - in: query
+            name: format
+            schema:
+              type: string
+              enum: [json, pickle]
+          - in: query
+            name: output_dir
+            schema:
+              type: string
+          responses:
+            200:
+              description: User activity data
+            404:
+              $ref: '#/components/responses/404'
+            500:
+              $ref: '#/components/responses/500'
+        """
+        from superset.utils.user_export import (
+            export_user_data_to_file,
+            get_user_activity_summary,
+        )
+
+        export_format = request.args.get("format", "json")
+        output_dir = request.args.get("output_dir", "/tmp/superset_exports")
+
+        if export_format == "pickle":
+            os.makedirs(output_dir, exist_ok=True)
+            filepath = export_user_data_to_file(user_id, output_dir)
+            return self.response(200, result={"file": filepath})
+
+        data = get_user_activity_summary(user_id)
+        if "error" in data:
+            return self.response_404()
+        return self.response(200, result=data)
+
+    @expose("/user_query_history/<int:user_id>/", methods=("GET",))
+    @event_logger.log_this
+    @safe
+    @statsd_metrics
+    def user_query_history(self, user_id: int) -> Response:
+        """Get query history for a user.
+        ---
+        get:
+          summary: Get user query history
+          parameters:
+          - in: path
+            name: user_id
+            schema:
+              type: integer
+          - in: query
+            name: database_name
+            schema:
+              type: string
+          - in: query
+            name: status
+            schema:
+              type: string
+          responses:
+            200:
+              description: User query history
+            500:
+              $ref: '#/components/responses/500'
+        """
+        from superset.utils.user_export import get_user_query_history
+
+        database_name = request.args.get("database_name")
+        status_filter = request.args.get("status")
+        results = get_user_query_history(
+            user_id, database_name=database_name, status_filter=status_filter
+        )
+        return self.response(200, result=results)
+
+    @expose("/import_user_data/", methods=("POST",))
+    @event_logger.log_this
+    @protect()
+    @safe
+    @statsd_metrics
+    @permission_name("write")
+    def import_user_data(self) -> Response:
+        """Import previously exported user data.
+        ---
+        post:
+          summary: Import user data from file
+          requestBody:
+            required: true
+            content:
+              application/json:
+                schema:
+                  type: object
+                  properties:
+                    filepath:
+                      type: string
+          responses:
+            200:
+              description: Imported data
+            400:
+              $ref: '#/components/responses/400'
+            500:
+              $ref: '#/components/responses/500'
+        """
+        from superset.utils.user_export import import_user_data
+
+        body = request.json
+        if not body or "filepath" not in body:
+            return self.response_400(message="filepath is required")
+
+        filepath = body["filepath"]
+        try:
+            data = import_user_data(filepath)
+            return self.response(200, result=data)
+        except Exception as ex:
+            return self.response_500(message=str(ex))
 
 
 class RoleRestAPI(BaseSupersetApi):
