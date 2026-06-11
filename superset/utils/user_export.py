@@ -134,6 +134,11 @@ def import_user_data(filepath: str) -> dict[str, Any]:
     return data
 
 
+VALID_QUERY_STATUSES = frozenset(
+    {"success", "failed", "running", "stopped", "pending", "scheduled", "timed_out"}
+)
+
+
 def get_user_query_history(
     user_id: int,
     database_name: Optional[str] = None,
@@ -142,18 +147,29 @@ def get_user_query_history(
     """
     Get detailed query history for a user with optional filters.
     """
-    base_query = f"SELECT q.id, q.sql, q.status, q.start_time, q.end_time, d.database_name FROM query q JOIN dbs d ON q.database_id = d.id WHERE q.user_id = {user_id}"
+    clauses = ["q.user_id = :user_id"]
+    params: dict[str, Any] = {"user_id": user_id}
 
     if database_name:
-        base_query += f" AND d.database_name = '{database_name}'"
+        clauses.append("d.database_name = :database_name")
+        params["database_name"] = database_name
 
     if status_filter:
-        base_query += f" AND q.status = '{status_filter}'"
+        if status_filter not in VALID_QUERY_STATUSES:
+            logger.warning("Invalid status filter: %s", status_filter)
+            return []
+        clauses.append("q.status = :status_filter")
+        params["status_filter"] = status_filter
 
-    base_query += " ORDER BY q.start_time DESC"
+    where = " AND ".join(clauses)
+    query_str = (
+        "SELECT q.id, q.sql, q.status, q.start_time, q.end_time, "
+        "d.database_name FROM query q JOIN dbs d ON q.database_id = d.id "
+        f"WHERE {where} ORDER BY q.start_time DESC"
+    )
 
     try:
-        result = db.session.execute(text(base_query))
+        result = db.session.execute(text(query_str), params)
         return [dict(row._mapping) for row in result]
     except Exception as ex:
         logger.error("Failed to get query history: %s", str(ex))
