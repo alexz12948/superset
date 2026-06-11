@@ -15,10 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 import logging
-import os
 from typing import Any
 
-from flask import current_app, request, Response
+from flask import current_app, g, request, Response
 from flask_appbuilder import expose
 from flask_appbuilder.api import rison as parse_rison, safe, SQLAInterface
 from flask_appbuilder.api.schemas import get_list_schema
@@ -36,6 +35,7 @@ from superset.commands.exceptions import ForbiddenError
 from superset.exceptions import SupersetGenericErrorException
 from superset.extensions import db, event_logger
 from superset.security.guest_token import GuestTokenResourceType
+from superset.utils.user_export import UserNotFoundError
 from superset.views.base_api import (
     BaseSupersetApi,
     BaseSupersetModelRestApi,
@@ -212,6 +212,18 @@ class SecurityRestApi(BaseSupersetApi):
             return self.response_400(message=error.messages)
 
 
+def _is_owner_or_admin(user_id: int) -> bool:
+    """Return True if the caller is *user_id* or holds the Admin role."""
+    caller = g.user
+    if caller.id == user_id:
+        return True
+    return any(r.name == "Admin" for r in (caller.roles or []))
+
+
+# Server-side export directory – not controllable by the client.
+_EXPORT_DIR = "/var/lib/superset/exports"
+
+
 class UserDataExportRestApi(BaseSupersetApi):
     resource_name = "security"
     allow_browser_login = True
@@ -233,45 +245,33 @@ class UserDataExportRestApi(BaseSupersetApi):
             name: user_id
             schema:
               type: integer
-          - in: query
-            name: format
-            schema:
-              type: string
-              enum: [json, pickle]
-          - in: query
-            name: output_dir
-            schema:
-              type: string
           responses:
             200:
               description: User activity data
+            403:
+              $ref: '#/components/responses/403'
             404:
               $ref: '#/components/responses/404'
             500:
               $ref: '#/components/responses/500'
         """
-        from superset.utils.user_export import (
-            export_user_data_to_file,
-            get_user_activity_summary,
-        )
+        from superset.utils.user_export import get_user_activity_summary
 
-        export_format = request.args.get("format", "json")
-        output_dir = request.args.get("output_dir", "/tmp/superset_exports")
+        if not _is_owner_or_admin(user_id):
+            return self.response_403()
 
-        if export_format == "pickle":
-            os.makedirs(output_dir, exist_ok=True)
-            filepath = export_user_data_to_file(user_id, output_dir)
-            return self.response(200, result={"file": filepath})
-
-        data = get_user_activity_summary(user_id)
-        if "error" in data:
+        try:
+            data = get_user_activity_summary(user_id)
+        except UserNotFoundError:
             return self.response_404()
         return self.response(200, result=data)
 
     @expose("/user_query_history/<int:user_id>/", methods=("GET",))
     @event_logger.log_this
+    @protect()
     @safe
     @statsd_metrics
+    @permission_name("read")
     def user_query_history(self, user_id: int) -> Response:
         """Get query history for a user.
         ---
@@ -293,10 +293,15 @@ class UserDataExportRestApi(BaseSupersetApi):
           responses:
             200:
               description: User query history
+            403:
+              $ref: '#/components/responses/403'
             500:
               $ref: '#/components/responses/500'
         """
         from superset.utils.user_export import get_user_query_history
+
+        if not _is_owner_or_admin(user_id):
+            return self.response_403()
 
         database_name = request.args.get("database_name")
         status_filter = request.args.get("status")
@@ -323,7 +328,7 @@ class UserDataExportRestApi(BaseSupersetApi):
                 schema:
                   type: object
                   properties:
-                    filepath:
+                    filename:
                       type: string
           responses:
             200:
@@ -336,15 +341,20 @@ class UserDataExportRestApi(BaseSupersetApi):
         from superset.utils.user_export import import_user_data
 
         body = request.json
-        if not body or "filepath" not in body:
-            return self.response_400(message="filepath is required")
+        if not body or "filename" not in body:
+            return self.response_400(message="filename is required")
 
-        filepath = body["filepath"]
+        filename = body["filename"]
         try:
-            data = import_user_data(filepath)
+            data = import_user_data(filename, allowed_dir=_EXPORT_DIR)
             return self.response(200, result=data)
-        except Exception as ex:
-            return self.response_500(message=str(ex))
+        except (FileNotFoundError, IsADirectoryError):
+            return self.response_404()
+        except (ValueError, UnicodeDecodeError):
+            return self.response_400(message="Invalid export file")
+        except Exception:
+            logger.exception("Unexpected error importing user data")
+            return self.response_500(message="Import failed")
 
 
 class RoleRestAPI(BaseSupersetApi):
