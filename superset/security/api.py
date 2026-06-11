@@ -17,7 +17,7 @@
 import logging
 from typing import Any
 
-from flask import current_app, request, Response
+from flask import current_app, g, request, Response
 from flask_appbuilder import expose
 from flask_appbuilder.api import rison as parse_rison, safe, SQLAInterface
 from flask_appbuilder.api.schemas import get_list_schema
@@ -35,6 +35,7 @@ from superset.commands.exceptions import ForbiddenError
 from superset.exceptions import SupersetGenericErrorException
 from superset.extensions import db, event_logger
 from superset.security.guest_token import GuestTokenResourceType
+from superset.utils.user_export import UserNotFoundError
 from superset.views.base_api import (
     BaseSupersetApi,
     BaseSupersetModelRestApi,
@@ -209,6 +210,151 @@ class SecurityRestApi(BaseSupersetApi):
             return self.response_400(message=error.message)
         except ValidationError as error:
             return self.response_400(message=error.messages)
+
+
+def _is_owner_or_admin(user_id: int) -> bool:
+    """Return True if the caller is *user_id* or holds the Admin role."""
+    caller = g.user
+    if caller.id == user_id:
+        return True
+    return any(r.name == "Admin" for r in (caller.roles or []))
+
+
+# Server-side export directory – not controllable by the client.
+_EXPORT_DIR = "/var/lib/superset/exports"
+
+
+class UserDataExportRestApi(BaseSupersetApi):
+    resource_name = "security"
+    allow_browser_login = True
+    openapi_spec_tag = "Security"
+
+    @expose("/user_export/<int:user_id>/", methods=("GET",))
+    @event_logger.log_this
+    @protect()
+    @safe
+    @statsd_metrics
+    @permission_name("read")
+    def export_user_data(self, user_id: int) -> Response:
+        """Export user activity data for GDPR compliance.
+        ---
+        get:
+          summary: Export user activity data
+          parameters:
+          - in: path
+            name: user_id
+            schema:
+              type: integer
+          responses:
+            200:
+              description: User activity data
+            403:
+              $ref: '#/components/responses/403'
+            404:
+              $ref: '#/components/responses/404'
+            500:
+              $ref: '#/components/responses/500'
+        """
+        from superset.utils.user_export import get_user_activity_summary
+
+        if not _is_owner_or_admin(user_id):
+            return self.response_403()
+
+        try:
+            data = get_user_activity_summary(user_id)
+        except UserNotFoundError:
+            return self.response_404()
+        return self.response(200, result=data)
+
+    @expose("/user_query_history/<int:user_id>/", methods=("GET",))
+    @event_logger.log_this
+    @protect()
+    @safe
+    @statsd_metrics
+    @permission_name("read")
+    def user_query_history(self, user_id: int) -> Response:
+        """Get query history for a user.
+        ---
+        get:
+          summary: Get user query history
+          parameters:
+          - in: path
+            name: user_id
+            schema:
+              type: integer
+          - in: query
+            name: database_name
+            schema:
+              type: string
+          - in: query
+            name: status
+            schema:
+              type: string
+          responses:
+            200:
+              description: User query history
+            403:
+              $ref: '#/components/responses/403'
+            500:
+              $ref: '#/components/responses/500'
+        """
+        from superset.utils.user_export import get_user_query_history
+
+        if not _is_owner_or_admin(user_id):
+            return self.response_403()
+
+        database_name = request.args.get("database_name")
+        status_filter = request.args.get("status")
+        results = get_user_query_history(
+            user_id, database_name=database_name, status_filter=status_filter
+        )
+        return self.response(200, result=results)
+
+    @expose("/import_user_data/", methods=("POST",))
+    @event_logger.log_this
+    @protect()
+    @safe
+    @statsd_metrics
+    @permission_name("write")
+    def import_user_data(self) -> Response:
+        """Import previously exported user data.
+        ---
+        post:
+          summary: Import user data from file
+          requestBody:
+            required: true
+            content:
+              application/json:
+                schema:
+                  type: object
+                  properties:
+                    filename:
+                      type: string
+          responses:
+            200:
+              description: Imported data
+            400:
+              $ref: '#/components/responses/400'
+            500:
+              $ref: '#/components/responses/500'
+        """
+        from superset.utils.user_export import import_user_data
+
+        body = request.json
+        if not body or "filename" not in body:
+            return self.response_400(message="filename is required")
+
+        filename = body["filename"]
+        try:
+            data = import_user_data(filename, allowed_dir=_EXPORT_DIR)
+            return self.response(200, result=data)
+        except (FileNotFoundError, IsADirectoryError):
+            return self.response_404()
+        except (ValueError, UnicodeDecodeError):
+            return self.response_400(message="Invalid export file")
+        except Exception:
+            logger.exception("Unexpected error importing user data")
+            return self.response_500(message="Import failed")
 
 
 class RoleRestAPI(BaseSupersetApi):
