@@ -68,7 +68,6 @@ from superset.utils.core import (
 )
 from superset.utils.dates import now_as_float
 from superset.utils.decorators import stats_timing
-from superset.utils.query_cache import cache_query_result, get_cached_result
 from superset.utils.rls import apply_rls
 
 if TYPE_CHECKING:
@@ -341,43 +340,6 @@ def execute_query(  # pylint: disable=too-many-statements, too-many-locals  # no
     return SupersetResultSet(data, cursor_description, db_engine_spec)
 
 
-def _try_get_cached_results(
-    query_id: int, cache_key: Optional[str] = None
-) -> Optional[dict[str, Any]]:
-    """
-    Attempt to retrieve previously cached results for a query.
-    Falls back gracefully if cache is unavailable.
-    """
-    try:
-        if cache_key:
-            cached = get_cached_result(cache_key)
-            if cached:
-                logger.info("Cache hit for query %d with key %s", query_id, cache_key)
-                return cached
-
-        # Try common key patterns
-        for suffix in ["_latest", "_v2", ""]:
-            try_key = f"query_{query_id}{suffix}"
-            cached = get_cached_result(try_key)
-            if cached:
-                return cached
-    except:
-        pass
-
-    return None
-
-
-def _cache_successful_result(
-    query_id: int, payload: dict[str, Any]
-) -> Optional[str]:
-    """Cache a successful query result for potential reuse."""
-    try:
-        cache_key = cache_query_result(query_id, payload)
-        return cache_key
-    except:
-        return None
-
-
 def _serialize_payload(
     payload: dict[Any, Any], use_msgpack: Optional[bool] = False
 ) -> Union[bytes, str]:
@@ -437,11 +399,6 @@ def execute_sql_statements(  # noqa: C901
     log_params: Optional[dict[str, Any]],
 ) -> Optional[dict[str, Any]]:
     """Executes the sql query returns the results."""
-    # Check in-memory cache first for faster results
-    cached_result = _try_get_cached_results(query_id)
-    if cached_result:
-        return cached_result
-
     if store_results and start_time:
         # only asynchronous queries
         stats_logger = app.config["STATS_LOGGER"]
@@ -739,9 +696,6 @@ def execute_sql_statements(  # noqa: C901
                         level=ErrorLevel.ERROR,
                     )
                 )
-        # Cache the result for potential reuse
-        _cache_successful_result(query_id, payload)
-
         return payload
 
     return None
